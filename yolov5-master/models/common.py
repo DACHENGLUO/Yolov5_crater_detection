@@ -33,8 +33,136 @@ def autopad(k, p=None):  # kernel, padding
     if p is None:
         p = k // 2 if isinstance(k, int) else (x // 2 for x in k)  # auto-pad
     return p
+def kaiming_init(module,
+                 a=0,
+                 mode='fan_out',
+                 nonlinearity='relu',
+                 bias=0,
+                 distribution='normal'):
+    assert distribution in ['uniform', 'normal']
+    if hasattr(module, 'weight') and module.weight is not None:
+        if distribution == 'uniform':
+            nn.init.kaiming_uniform_(
+                module.weight, a=a, mode=mode, nonlinearity=nonlinearity)
+        else:
+            nn.init.kaiming_normal_(
+                module.weight, a=a, mode=mode, nonlinearity=nonlinearity)
+    if hasattr(module, 'bias') and module.bias is not None:
+        nn.init.constant_(module.bias, bias)
+        
+def last_zero_init(m):
+    if isinstance(m, nn.Sequential):
+        constant_init(m[-1], val=0)
+        m[-1].inited = True
+    else:
+        constant_init(m, val=0)
+        m.inited = True
 
+def constant_init(module, val, bias=0):
+    if hasattr(module, 'weight') and module.weight is not None:
+        nn.init.constant_(module.weight, val)
+    if hasattr(module, 'bias') and module.bias is not None:
+        nn.init.constant_(module.bias, bias)
+        
+class ContextBlock2d(nn.Module):
+    """ContextBlock2d
+    Parameters
+    ----------
+    inplanes : int
+        Number of in_channels.
+    pool : string
+        spatial att or global pooling (default:'att').
+    fusions : list
+    Reference:
+        Yue Cao, et al. "GCNet: Non-local Networks Meet Squeeze-Excitation Networks and Beyond."
+    """
+    def __init__(self, inplanes, pool='att', fusions=['channel_add', 'channel_mul']):
+        super(ContextBlock2d, self).__init__()
+        assert pool in ['avg', 'att']
+        assert all([f in ['channel_add', 'channel_mul'] for f in fusions])
+        assert len(fusions) > 0, 'at least one fusion should be used'
+        self.inplanes = inplanes
+        self.planes = inplanes // 4
+        self.pool = pool
+        self.fusions = fusions
+        if 'att' in pool:
+            self.conv_mask = nn.Conv2d(inplanes, 1, kernel_size=1)
+            self.softmax = nn.Softmax(dim=2)
+        else:
+            self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        if 'channel_add' in fusions:
+            self.channel_add_conv = nn.Sequential(
+                nn.Conv2d(self.inplanes, self.planes, kernel_size=1),
+                nn.LayerNorm([self.planes, 1, 1]),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(self.planes, self.inplanes, kernel_size=1)
+            )
+        else:
+            self.channel_add_conv = None
+        if 'channel_mul' in fusions:
+            self.channel_mul_conv = nn.Sequential(
+                nn.Conv2d(self.inplanes, self.planes, kernel_size=1),
+                nn.LayerNorm([self.planes, 1, 1]),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(self.planes, self.inplanes, kernel_size=1)
+            )
+        else:
+            self.channel_mul_conv = None
+        self.reset_parameters()
 
+    def reset_parameters(self):
+        if self.pool == 'att':
+            kaiming_init(self.conv_mask, mode='fan_in')
+            self.conv_mask.inited = True
+
+        if self.channel_add_conv is not None:
+            last_zero_init(self.channel_add_conv)
+        if self.channel_mul_conv is not None:
+            last_zero_init(self.channel_mul_conv)
+
+    def spatial_pool(self, x):
+        batch, channel, height, width = x.size()
+        if self.pool == 'att':
+            input_x = x
+            # [N, C, H * W]
+            input_x = input_x.view(batch, channel, height * width)
+            # [N, 1, C, H * W]
+            input_x = input_x.unsqueeze(1)
+            # [N, 1, H, W]
+            context_mask = self.conv_mask(x)
+            # [N, 1, H * W]
+            context_mask = context_mask.view(batch, 1, height * width)
+            # [N, 1, H * W]
+            context_mask = self.softmax(context_mask)
+            # [N, 1, H * W, 1]
+            context_mask = context_mask.unsqueeze(3)
+            # [N, 1, C, 1]
+            context = torch.matmul(input_x, context_mask)
+            # [N, C, 1, 1]
+            context = context.view(batch, channel, 1, 1)
+        else:
+            # [N, C, 1, 1]
+            context = self.avg_pool(x)
+
+        return context
+
+    def forward(self, x):
+        # [N, C, 1, 1]
+        context = self.spatial_pool(x)
+
+        if self.channel_mul_conv is not None:
+            # [N, C, 1, 1]
+            channel_mul_term = torch.sigmoid(self.channel_mul_conv(context))
+            out = x * channel_mul_term
+        else:
+            out = x
+        if self.channel_add_conv is not None:
+            # [N, C, 1, 1]
+            channel_add_term = self.channel_add_conv(context)
+            out = out + channel_add_term
+        return out
+
+    
 class Conv(nn.Module):
     # Standard convolution
     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True):  # ch_in, ch_out, kernel, stride, padding, groups
@@ -55,14 +183,13 @@ class ConvDown(nn.Module):
         super().__init__()
         self.conv = nn.Conv2d(c1, c2, k, s, padding=0, groups=g, bias=False)
         self.bn = nn.BatchNorm2d(c2)
-        self.act = nn.GELU() if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
+        self.act = nn.SiLU() if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
 
     def forward(self, x):
         return self.act(self.bn(self.conv(x)))
 
     def forward_fuse(self, x):
         return self.act(self.conv(x))
-
 
 class DWConv(Conv):
     # Depth-wise convolution class
@@ -151,6 +278,20 @@ class C3(nn.Module):
 
     def forward(self, x):
         return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1))
+class C3_GC(nn.Module):
+    # CSP Bottleneck with 3 convolutions
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.gc = ContextBlock2d(c1)
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c1, c_, 1, 1)
+        self.cv3 = Conv(2 * c_, c2, 1)  # optional act=FReLU(c2)
+        self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
+        # self.m = nn.Sequential(*(CrossConv(c_, c_, 3, 1, g, 1.0, shortcut) for _ in range(n)))
+
+    def forward(self, x):
+        return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(self.gc(x))), 1))    
 
 
 class C3TR(C3):
@@ -242,7 +383,6 @@ class GhostConv(nn.Module):
         y = self.cv1(x)
         return torch.cat((y, self.cv2(y)), 1)
 
-
 class LayerNorm(nn.Module):
     r""" LayerNorm that supports two data formats: channels_last (default) or channels_first. 
     The ordering of the dimensions in the inputs. channels_last corresponds to inputs with 
@@ -283,11 +423,13 @@ class ConvNeXtBottleneck(nn.Module):
         #                             requires_grad=True) if layer_scale_init_value > 0 else None
         # self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.dwconv = nn.Conv2d(c1, c1, kernel_size=7, padding=3, groups=c1) # depthwise conv
-        self.norm1 = LayerNorm(c1, eps=1e-6,data_format="channels_first")
+        #self.norm1 = LayerNorm(c1, eps=1e-6,data_format="channels_first")
+        self.norm1 = nn.BatchNorm2d(c1)
         self.pwconv1 = nn.Conv2d(c1, 4*c1, kernel_size=1, stride=1, padding=0)
         self.act1 = nn.GELU()
         self.pwconv2 = nn.Conv2d(4*c1, c2, kernel_size=1, stride=1, padding=0)
-        self.norm2 = LayerNorm(c2, eps=1e-6,data_format="channels_first")
+        #self.norm2 = LayerNorm(c2, eps=1e-6,data_format="channels_first")
+        self.norm2 = nn.BatchNorm2d(c2)
         self.act2 = nn.GELU()
 
         self.shortcut = nn.Identity()
@@ -310,12 +452,11 @@ class GhostBottleneck(nn.Module):
     def __init__(self, c1, c2, k=3, s=1):  # ch_in, ch_out, kernel, stride
         super().__init__()
         c_ = c2 // 2
-        self.conv = nn.Sequential(
-            GhostConv(c1, c_, 1, 1),  # pw
-            DWConv(c_, c_, k, s, act=False) if s == 2 else nn.Identity(),  # dw
-            GhostConv(c_, c2, 1, 1, act=False))  # pw-linear
-        self.shortcut = nn.Sequential(DWConv(c1, c1, k, s, act=False), Conv(c1, c2, 1, 1,
-                                                                            act=False)) if s == 2 else nn.Identity()
+        self.conv = nn.Sequential(GhostConv(c1, c_, 1, 1),  # pw
+                                  DWConv(c_, c_, k, s, act=False) if s == 2 else nn.Identity(),  # dw
+                                  GhostConv(c_, c2, 1, 1, act=False))  # pw-linear
+        self.shortcut = nn.Sequential(DWConv(c1, c1, k, s, act=False),
+                                      Conv(c1, c2, 1, 1, act=False)) if s == 2 else nn.Identity()
 
     def forward(self, x):
         return self.conv(x) + self.shortcut(x)
@@ -379,7 +520,7 @@ class DetectMultiBackend(nn.Module):
         super().__init__()
         w = str(weights[0] if isinstance(weights, list) else weights)
         pt, jit, onnx, xml, engine, coreml, saved_model, pb, tflite, edgetpu, tfjs = self.model_type(w)  # get backend
-        stride, names = 32, [f'class{i}' for i in range(1000)]  # assign defaults
+        stride, names = 64, [f'class{i}' for i in range(1000)]  # assign defaults
         w = attempt_download(w)  # download if not local
         fp16 &= (pt or jit or onnx or engine) and device.type != 'cpu'  # FP16
         if data:  # data.yaml path (optional)
@@ -411,9 +552,6 @@ class DetectMultiBackend(nn.Module):
             import onnxruntime
             providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if cuda else ['CPUExecutionProvider']
             session = onnxruntime.InferenceSession(w, providers=providers)
-            meta = session.get_modelmeta().custom_metadata_map  # metadata
-            if 'stride' in meta:
-                stride, names = int(meta['stride']), eval(meta['names'])
         elif xml:  # OpenVINO
             LOGGER.info(f'Loading {w} for OpenVINO inference...')
             check_requirements(('openvino-dev',))  # requires openvino-dev: https://pypi.org/project/openvino-dev/
@@ -464,8 +602,7 @@ class DetectMultiBackend(nn.Module):
                     return x.prune(tf.nest.map_structure(ge, inputs), tf.nest.map_structure(ge, outputs))
 
                 gd = tf.Graph().as_graph_def()  # graph_def
-                with open(w, 'rb') as f:
-                    gd.ParseFromString(f.read())
+                gd.ParseFromString(open(w, 'rb').read())
                 frozen_func = wrap_frozen_graph(gd, inputs="x:0", outputs="Identity:0")
             elif tflite or edgetpu:  # https://www.tensorflow.org/lite/guide/python#install_tensorflow_lite_for_python
                 try:  # https://coral.ai/docs/edgetpu/tflite-python/#update-existing-tf-lite-code-for-the-edge-tpu
@@ -475,10 +612,9 @@ class DetectMultiBackend(nn.Module):
                     Interpreter, load_delegate = tf.lite.Interpreter, tf.lite.experimental.load_delegate,
                 if edgetpu:  # Edge TPU https://coral.ai/software/#edgetpu-runtime
                     LOGGER.info(f'Loading {w} for TensorFlow Lite Edge TPU inference...')
-                    delegate = {
-                        'Linux': 'libedgetpu.so.1',
-                        'Darwin': 'libedgetpu.1.dylib',
-                        'Windows': 'edgetpu.dll'}[platform.system()]
+                    delegate = {'Linux': 'libedgetpu.so.1',
+                                'Darwin': 'libedgetpu.1.dylib',
+                                'Windows': 'edgetpu.dll'}[platform.system()]
                     interpreter = Interpreter(model_path=w, experimental_delegates=[load_delegate(delegate)])
                 else:  # Lite
                     LOGGER.info(f'Loading {w} for TensorFlow Lite inference...')
@@ -493,10 +629,9 @@ class DetectMultiBackend(nn.Module):
     def forward(self, im, augment=False, visualize=False, val=False):
         # YOLOv5 MultiBackend inference
         b, ch, h, w = im.shape  # batch, channel, height, width
-        if self.pt:  # PyTorch
-            y = self.model(im, augment=augment, visualize=visualize)[0]
-        elif self.jit:  # TorchScript
-            y = self.model(im)[0]
+        if self.pt or self.jit:  # PyTorch
+            y = self.model(im) if self.jit else self.model(im, augment=augment, visualize=visualize)
+            return y if val else y[0]
         elif self.dnn:  # ONNX OpenCV DNN
             im = im.cpu().numpy()  # torch to numpy
             self.net.setInput(im)
@@ -614,14 +749,14 @@ class AutoShape(nn.Module):
         #   multiple:        = [Image.open('image1.jpg'), Image.open('image2.jpg'), ...]  # list of images
 
         t = [time_sync()]
-        p = next(self.model.parameters()) if self.pt else torch.zeros(1, device=self.model.device)  # for device, type
+        p = next(self.model.parameters()) if self.pt else torch.zeros(1)  # for device and type
         autocast = self.amp and (p.device.type != 'cpu')  # Automatic Mixed Precision (AMP) inference
         if isinstance(imgs, torch.Tensor):  # torch
             with amp.autocast(autocast):
                 return self.model(imgs.to(p.device).type_as(p), augment, profile)  # inference
 
         # Pre-process
-        n, imgs = (len(imgs), list(imgs)) if isinstance(imgs, (list, tuple)) else (1, [imgs])  # number, list of images
+        n, imgs = (len(imgs), imgs) if isinstance(imgs, list) else (1, [imgs])  # number of images, list of images
         shape0, shape1, files = [], [], []  # image and inference shapes, filenames
         for i, im in enumerate(imgs):
             f = f'image{i}'  # filename
@@ -651,13 +786,8 @@ class AutoShape(nn.Module):
             t.append(time_sync())
 
             # Post-process
-            y = non_max_suppression(y if self.dmb else y[0],
-                                    self.conf,
-                                    self.iou,
-                                    self.classes,
-                                    self.agnostic,
-                                    self.multi_label,
-                                    max_det=self.max_det)  # NMS
+            y = non_max_suppression(y if self.dmb else y[0], self.conf, self.iou, self.classes, self.agnostic,
+                                    self.multi_label, max_det=self.max_det)  # NMS
             for i in range(n):
                 scale_coords(shape1, y[i][:, :4], shape0[i])
 
@@ -698,12 +828,8 @@ class Detections:
                         label = f'{self.names[int(cls)]} {conf:.2f}'
                         if crop:
                             file = save_dir / 'crops' / self.names[int(cls)] / self.files[i] if save else None
-                            crops.append({
-                                'box': box,
-                                'conf': conf,
-                                'cls': cls,
-                                'label': label,
-                                'im': save_one_box(box, im, file=file, save=save)})
+                            crops.append({'box': box, 'conf': conf, 'cls': cls, 'label': label,
+                                          'im': save_one_box(box, im, file=file, save=save)})
                         else:  # all others
                             annotator.box_label(box, label if labels else '', color=colors(cls))
                     im = annotator.im
@@ -712,7 +838,7 @@ class Detections:
 
             im = Image.fromarray(im.astype(np.uint8)) if isinstance(im, np.ndarray) else im  # from np
             if pprint:
-                print(s.rstrip(', '))
+                LOGGER.info(s.rstrip(', '))
             if show:
                 im.show(self.files[i])  # show
             if save:
@@ -729,7 +855,8 @@ class Detections:
 
     def print(self):
         self.display(pprint=True)  # print results
-        print(f'Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS per image at shape {tuple(self.s)}' % self.t)
+        LOGGER.info(f'Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS per image at shape {tuple(self.s)}' %
+                    self.t)
 
     def show(self, labels=True):
         self.display(show=True, labels=labels)  # show results
@@ -766,11 +893,7 @@ class Detections:
         return x
 
     def __len__(self):
-        return self.n  # override len(results)
-
-    def __str__(self):
-        self.print()  # override print(results)
-        return ''
+        return self.n
 
 
 class Classify(nn.Module):
@@ -784,3 +907,6 @@ class Classify(nn.Module):
     def forward(self, x):
         z = torch.cat([self.aap(y) for y in (x if isinstance(x, list) else [x])], 1)  # cat if list
         return self.flat(self.conv(z))  # flatten to x(b,c2)
+
+    
+    
